@@ -1,0 +1,16 @@
+# .gitignore
+
+# Lokala rådatafiler (Spara inte gigantiska CSV:er på GitHub)
+*.csv
+temp_*.csv
+
+# Sparade ML-modeller
+saved_models/
+*.json
+*.pkl
+
+# Python-miljö och systemfiler
+__pycache__/
+.ipynb_checkpoints/
+.DS_Store
+.env
