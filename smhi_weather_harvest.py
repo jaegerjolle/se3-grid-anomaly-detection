@@ -28,7 +28,11 @@ for stad_namn, station_id in stader.items():
     print(f"Hämtar data för {stad_namn}...")
     
     # SMHI API-url för korrigerat historiskt arkiv (parameter 1 = lufttemperatur)
-    url = f"https://smhi.se{station_id}/period/corrected-archive/data.csv"
+    url = (
+    "https://opendata-download-metobs.smhi.se/"
+    f"api/version/latest/parameter/1/station/{station_id}/"
+    "period/corrected-archive/data.csv"
+)
     
     try:
         # Hämta datan från SMHI
