@@ -28,7 +28,7 @@ CITIES = {
 }
 
 ANOMALY_THRESHOLD = 35.0  # MWh
-DATA_LOOKBACK_HOURS = 24  # SVK data lag
+DATA_LOOKBACK_HOURS = 24  # SVK data lag (SVK gives yesterday's data today)
 
 # ==================== VALIDATION FUNCTIONS ====================
 def validate_svk_response(response_data, target_time):
@@ -37,7 +37,7 @@ def validate_svk_response(response_data, target_time):
     
     Args:
         response_data (dict): Raw JSON response from SVK API
-        target_time (datetime): Expected timestamp to find
+        target_time (datetime): Expected timestamp to find (exact date + hour)
         
     Returns:
         tuple: (is_valid, load_mwh, losses_mwh, error_msg)
@@ -56,7 +56,7 @@ def validate_svk_response(response_data, target_time):
         if len(response_data["dataPoints"]) == 0:
             return False, None, None, "SVK dataPoints is empty"
         
-        # Format expected timestamp
+        # Format expected timestamp (exact match: YYYY-MM-DDTHH:00:00Z)
         target_hour_str = target_time.strftime("%Y-%m-%dT%H:00:00Z")
         
         # Find matching datapoint
@@ -100,7 +100,7 @@ def validate_svk_response(response_data, target_time):
         if losses > load:
             return False, None, None, f"Losses ({losses}) cannot exceed load ({load})"
         
-        logger.info(f"✓ SVK validation passed: Load={load} MWh, Losses={losses} MWh")
+        logger.info(f"✓ SVK validation passed for {target_hour_str}: Load={load} MWh, Losses={losses} MWh")
         return True, load, losses, None
         
     except Exception as e:
@@ -110,11 +110,12 @@ def validate_svk_response(response_data, target_time):
 def fetch_smhi_city_temperature(city_name, station_id, target_time):
     """
     Fetch temperature for a specific city from SMHI API using station ID.
+    SYNCHRONIZED: Matches exact date + hour (not just hour) to align with SVK data.
     
     Args:
         city_name (str): Name of city (for logging)
         station_id (str): SMHI station ID
-        target_time (datetime): Target timestamp to find
+        target_time (datetime): Target timestamp to find (exact date + hour match)
         
     Returns:
         tuple: (success: bool, temperature: float, error_msg: str)
@@ -141,8 +142,11 @@ def fetch_smhi_city_temperature(city_name, station_id, target_time):
         if not isinstance(response_data["value"], list) or len(response_data["value"]) == 0:
             return False, None, f"{city_name}: No temperature data available"
         
-        # Find temperature for matching hour
+        # *** CRITICAL FIX: Match exact DATE + HOUR, not just hour ***
+        # This ensures SMHI data is synchronized with SVK data timeframe
+        target_date = target_time.date()
         target_hour = target_time.hour
+        
         matching_temp = None
         
         for entry in response_data["value"]:
@@ -153,17 +157,20 @@ def fetch_smhi_city_temperature(city_name, station_id, target_time):
                 continue
             
             try:
-                # Convert milliseconds to datetime and check hour match
+                # Convert milliseconds to datetime and check BOTH date AND hour match
                 entry_time = datetime.fromtimestamp(float(entry["date"]) / 1000)
-                if entry_time.hour == target_hour:
+                # Match exact date (YYYY-MM-DD) AND hour (HH:00)
+                if entry_time.date() == target_date and entry_time.hour == target_hour:
                     matching_temp = entry
+                    logger.info(f"✓ {city_name}: Found matching entry for {entry_time.strftime('%Y-%m-%d %H:00')}")
                     break
             except (ValueError, TypeError, OSError):
                 continue
         
         if not matching_temp:
+            target_str = target_time.strftime("%Y-%m-%d %H:00")
             return False, None, (
-                f"{city_name}: No data for hour {target_hour:02d}:00"
+                f"{city_name}: No data for exact timestamp {target_str} UTC"
             )
         
         # Convert temperature to float
@@ -176,7 +183,7 @@ def fetch_smhi_city_temperature(city_name, station_id, target_time):
         if temp < -50 or temp > 50:
             return False, None, f"{city_name}: Temperature {temp}°C is unrealistic (range: -50 to 50)"
         
-        logger.info(f"✓ {city_name} temperature: {temp}°C")
+        logger.info(f"✓ {city_name} temperature: {temp}°C (synchronized to SVK timeframe)")
         return True, temp, None
         
     except requests.exceptions.Timeout:
@@ -194,12 +201,13 @@ def fetch_smhi_city_temperature(city_name, station_id, target_time):
 def fetch_svk_data(target_time):
     """
     Fetch and validate SVK grid data.
+    SVK provides data with ~24h lag, so we query for target_time (which is 24h ago).
     
     Returns:
         tuple: (success: bool, load: float, losses: float, error_msg: str)
     """
     try:
-        logger.info(f"Fetching SVK data for {target_time.strftime('%Y-%m-%d %H:00')}")
+        logger.info(f"Fetching SVK data for {target_time.strftime('%Y-%m-%d %H:00')} UTC")
         
         params = {
             "biddingArea": SVK_BIDDING_AREA,
@@ -234,8 +242,11 @@ def fetch_svk_data(target_time):
 def fetch_all_city_temperatures(target_time):
     """
     Fetch temperatures for all 5 cities from their respective SMHI stations.
-    Uses parallel-like approach for efficiency.
+    IMPORTANT: All cities fetched for the SAME target_time to maintain synchronization with SVK.
     
+    Args:
+        target_time (datetime): The synchronized timestamp (24 hours ago due to SVK lag)
+        
     Returns:
         tuple: (success: bool, temps_dict: dict, error_messages: list)
     """
@@ -246,7 +257,7 @@ def fetch_all_city_temperatures(target_time):
         success, temp, error_msg = fetch_smhi_city_temperature(
             city_name, 
             city_info["station_id"],
-            target_time
+            target_time  # SAME target_time for all cities (synchronized!)
         )
         
         if success:
@@ -308,35 +319,40 @@ if mode == "Simulering (Offline Dummy)":
 else:
     st.sidebar.info("🔄 Hämtar senaste tillgängliga data från SVK och SMHI...")
     
-    # Calculate target time (account for SVK data lag)
+    # Calculate target time: 24 hours ago
+    # Because SVK provides data with ~24h lag
+    # Example: Today at 14:00, we get SVK data from yesterday at 14:00
     target_time = datetime.now() - timedelta(hours=DATA_LOOKBACK_HOURS)
-    st.sidebar.write(f"📅 Visar nätstatus för: {target_time.strftime('%Y-%m-%d %H:00')} UTC")
-    st.sidebar.write(f"(Lookback: {DATA_LOOKBACK_HOURS}h due to SVK API lag)")
+    target_time_str = target_time.strftime('%Y-%m-%d %H:00')
     
-    # Fetch SVK Data
+    st.sidebar.write(f"📅 **Synchronized Timeframe:**")
+    st.sidebar.write(f"   {target_time_str} UTC (yesterday)")
+    st.sidebar.write(f"   (SVK lag: {DATA_LOOKBACK_HOURS}h)")
+    
+    # Fetch SVK Data (for target_time, which is 24h ago)
     svk_success, svk_load, svk_losses, svk_error = fetch_svk_data(target_time)
     
     if svk_success:
         live_load = svk_load
         actual_losses = svk_losses
-        st.sidebar.success(f"✓ SVK data loaded successfully")
+        st.sidebar.success(f"✓ SVK data loaded for {target_time_str}")
     else:
         st.sidebar.error(f"❌ SVK API Error: {svk_error}")
         st.sidebar.warning("⚠️ Falling back to dummy values (offline mode)")
         live_load, actual_losses = 5000, 150
     
-    # Fetch temperatures for ALL cities from their respective SMHI stations
+    # Fetch temperatures for ALL cities (synchronized to same target_time!)
     smhi_success, temps, smhi_errors = fetch_all_city_temperatures(target_time)
     
     if smhi_success:
-        st.sidebar.success("✓ All 5 city temperatures loaded from SMHI")
+        st.sidebar.success(f"✓ All 5 cities synchronized to {target_time_str}")
         # Display each city's temperature
         for city_name, city_info in CITIES.items():
             temp_col = city_info["temp_col"]
             temp_val = temps.get(temp_col, "N/A")
             st.sidebar.write(f"  • {city_name}: {temp_val}°C")
     else:
-        st.sidebar.warning("⚠️ Some SMHI requests failed, using fallback values:")
+        st.sidebar.warning(f"⚠️ Some SMHI requests failed for {target_time_str}:")
         for error in smhi_errors:
             st.sidebar.warning(f"  • {error}")
 
@@ -418,11 +434,16 @@ with c5:
 
 # ==================== DEBUG INFO ====================
 with st.expander("🔧 Debug Info"):
-    st.write(f"**Target Time:** {target_time.strftime('%Y-%m-%d %H:%M:%S UTC')}")
+    st.write(f"**Target Time (Synchronized):** {target_time.strftime('%Y-%m-%d %H:00 UTC')}")
     st.write(f"**Mode:** {mode}")
     st.write(f"**Anomaly Threshold:** {ANOMALY_THRESHOLD} MWh")
     st.write(f"**Current Residual:** {residual:.2f} MWh")
     st.write(f"**Status:** {'🔴 ANOMALY' if abs(residual) > ANOMALY_THRESHOLD else '🟢 NORMAL'}")
+    
+    st.write("\n**Data Synchronization:**")
+    st.write(f"  • SVK lookback: {DATA_LOOKBACK_HOURS}h (API lag)")
+    st.write(f"  • SMHI matching: Exact date + hour (synchronized)")
+    st.write(f"  • Both APIs query: {target_time.strftime('%Y-%m-%d %H:00 UTC')}")
     
     st.write("\n**Temperature Data Sources:**")
     for city_name, city_info in CITIES.items():
