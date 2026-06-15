@@ -1,51 +1,75 @@
 import requests
 import pandas as pd
+import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 
-# 1. Konfiguration för din insamling enligt MISS KISS
-elomrade = "SE3"
-idag = datetime.now()
-tva_ar_sedan = idag - timedelta(days=2*365)
+# -----------------------------
+# CONFIG
+# -----------------------------
+API_KEY = "DIN_API_KEY_HÄR"
 
-start_str = tva_ar_sedan.strftime("%Y-%m-%d")
-slut_str = idag.strftime("%Y-%m-%d")
+domain = "10YSE-1--------K"  # SE3
+start = (datetime.utcnow() - timedelta(days=730)).strftime("%Y%m%d%H%M")
+end = datetime.utcnow().strftime("%Y%m%d%H%M")
 
-print(f"Förbereder hämtning av nätdata för {elomrade} ({start_str} till {slut_str})...")
+print("Hämtar ENTSO-E SE3 load...")
 
-# 2. API-ändpunkt för Svenska kraftnäts nya SVK Data Service (SDS)
-# Obs: Vi hämtar mätdata för realiserad last och nätförluster
-url = "https://svk.se"
+url = "https://web-api.tp.entsoe.eu/api"
 
-parametrar = {
-    "biddingArea": elomrade,
-    "periodFrom": start_str,
-    "periodTo": slut_str,
-    "resolution": "hourly"  # Vi vill ha timdata för att matcha SMHI!
+params = {
+    "securityToken": API_KEY,
+    "documentType": "A65",   # Load
+    "processType": "A16",    # Realised
+    "outBiddingZone_Domain": domain,
+    "periodStart": start,
+    "periodEnd": end
 }
 
-try:
-    # 3. Gör API-anropet till Svenska kraftnät
-    print("Anropar SVK Data Service API...")
-    response = requests.get(url, params=parametrar, timeout=15)
-    response.raise_for_status() # Krascha snyggt om servern är nere
-    
-    # Konvertera JSON-svaret till en Pandas DataFrame
-    data_json = response.json()
-    df_raw = pd.DataFrame(data_json["dataPoints"])
-    
-    # 4. MISS KISS-rensning: Behåll bara fysikaliska kolumner (kasta priser/brus)
-    # Vi behöver: Tidsstämpel, total förbrukning (load) och nätförluster (losses)
-    df_clean = df_raw[["timestamp", "totalLoadMwh", "gridLossesMwh"]].copy()
-    
-    # Konvertera tidsstämplar till standardformat så det går lätt att merga med SMHI sen
-    df_clean["timestamp"] = pd.to_datetime(df_clean["timestamp"])
-    
-    # 5. Spara ner rådatan lokalt på din Mac (kommer ignoreras av din .gitignore!)
-    filnamn = f"svk_se3_2ar_natdata.csv"
-    df_clean.to_csv(filnamn, index=False, encoding="utf-8")
-    
-    print(f"\nKlart! Nätdata har sparats i: {filnamn}")
-    print(f"Totalt antal rader laddade: {len(df_clean)}")
+r = requests.get(url, params=params, timeout=30)
 
-except Exception as e:
-    print(f"Ett fel uppstod vid hämtning från Svenska kraftnät: {e}")
+print("HTTP:", r.status_code)
+
+if r.status_code != 200:
+    print(r.text[:500])
+    raise Exception("ENTSO-E API error")
+
+# -----------------------------
+# PARSE XML
+# -----------------------------
+root = ET.fromstring(r.content)
+
+ns = {"ns": "urn:iec62325.351:tc57wg16:451-3:publicationdocument:7:3"}
+
+rows = []
+
+for ts in root.findall(".//ns:TimeSeries", ns):
+    for period in ts.findall(".//ns:Period", ns):
+
+        start_time = period.find("ns:timeInterval/ns:start", ns).text
+
+        for point in period.findall("ns:Point", ns):
+            position = int(point.find("ns:position", ns).text)
+            value = float(point.find("ns:quantity", ns).text)
+
+            rows.append({
+                "position": position,
+                "value_mw": value,
+                "start_time": start_time
+            })
+
+df = pd.DataFrame(rows)
+
+# -----------------------------
+# CLEAN TIME
+# -----------------------------
+df["start_time"] = pd.to_datetime(df["start_time"])
+df = df.sort_values("start_time")
+
+# -----------------------------
+# SAVE
+# -----------------------------
+df.to_csv("entsoe_se3_load_2y.csv", index=False)
+
+print("KLART!")
+print("Rader:", len(df))
+print(df.head())
