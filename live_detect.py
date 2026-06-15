@@ -15,19 +15,20 @@ SVK_API_URL = "https://svk.se"
 SVK_TIMEOUT = 10
 SVK_BIDDING_AREA = "SE3"
 
-SMHI_API_URL = "https://smhi.se"
+SMHI_API_BASE = "https://smhi.se"
 SMHI_TIMEOUT = 10
+
+# SMHI Station IDs for each city (from smhi_weather_harvest.py)
+CITIES = {
+    "Gävle": {"station_id": "107420", "temp_col": "temp_Gavle"},
+    "Stockholm": {"station_id": "98210", "temp_col": "temp_Stockholm"},
+    "Västerås": {"station_id": "96190", "temp_col": "temp_Vasteras"},
+    "Örebro": {"station_id": "95160", "temp_col": "temp_Orebro"},
+    "Jönköping": {"station_id": "74460", "temp_col": "temp_Jonkoping"}
+}
 
 ANOMALY_THRESHOLD = 35.0  # MWh
 DATA_LOOKBACK_HOURS = 24  # SVK data lag
-
-CITIES = {
-    "Gävle": "t_gavle",
-    "Stockholm": "t_sthlm",
-    "Västerås": "t_vasteras",
-    "Örebro": "t_orebro",
-    "Jönköping": "t_jonkoping"
-}
 
 # ==================== VALIDATION FUNCTIONS ====================
 def validate_svk_response(response_data, target_time):
@@ -106,30 +107,39 @@ def validate_svk_response(response_data, target_time):
         return False, None, None, f"Unexpected SVK validation error: {str(e)}"
 
 
-def validate_smhi_response(response_data, target_time):
+def fetch_smhi_city_temperature(city_name, station_id, target_time):
     """
-    Validate SMHI API response structure and find temperature for target hour.
+    Fetch temperature for a specific city from SMHI API using station ID.
     
     Args:
-        response_data (dict): Raw JSON response from SMHI API
-        target_time (datetime): Expected timestamp (hour to match)
+        city_name (str): Name of city (for logging)
+        station_id (str): SMHI station ID
+        target_time (datetime): Target timestamp to find
         
     Returns:
-        tuple: (is_valid, temperature, error_msg)
+        tuple: (success: bool, temperature: float, error_msg: str)
     """
     try:
-        # Check if response has expected top-level structure
+        logger.info(f"Fetching SMHI data for {city_name} (station {station_id})")
+        
+        # Build SMHI API URL for the specific station
+        # Format: https://smhi.se{station_id}/period/corrected-archive/data.json
+        smhi_url = f"{SMHI_API_BASE}/{station_id}/period/corrected-archive/data.json"
+        
+        response = requests.get(smhi_url, timeout=SMHI_TIMEOUT)
+        response.raise_for_status()
+        
+        response_data = response.json()
+        
+        # Validate response structure
         if not isinstance(response_data, dict):
-            return False, None, "SMHI response is not a dictionary"
+            return False, None, f"{city_name}: Response is not a dictionary"
         
         if "value" not in response_data:
-            return False, None, "SMHI response missing 'value' field"
+            return False, None, f"{city_name}: Response missing 'value' field"
         
-        if not isinstance(response_data["value"], list):
-            return False, None, "'value' is not a list"
-        
-        if len(response_data["value"]) == 0:
-            return False, None, "SMHI value list is empty"
+        if not isinstance(response_data["value"], list) or len(response_data["value"]) == 0:
+            return False, None, f"{city_name}: No temperature data available"
         
         # Find temperature for matching hour
         target_hour = target_time.hour
@@ -137,44 +147,48 @@ def validate_smhi_response(response_data, target_time):
         
         for entry in response_data["value"]:
             if not isinstance(entry, dict):
-                logger.warning(f"Skipping non-dict SMHI entry: {entry}")
                 continue
             
             if "date" not in entry or "value" not in entry:
-                logger.warning(f"Skipping SMHI entry missing required fields: {entry}")
                 continue
             
             try:
-                # Convert milliseconds to datetime
+                # Convert milliseconds to datetime and check hour match
                 entry_time = datetime.fromtimestamp(float(entry["date"]) / 1000)
                 if entry_time.hour == target_hour:
                     matching_temp = entry
                     break
-            except (ValueError, TypeError, OSError) as e:
-                logger.warning(f"Could not parse SMHI timestamp {entry.get('date')}: {e}")
+            except (ValueError, TypeError, OSError):
                 continue
         
         if not matching_temp:
             return False, None, (
-                f"No temperature data found for hour {target_hour:02d}:00. "
-                "Data may be incomplete or from different time zone."
+                f"{city_name}: No data for hour {target_hour:02d}:00"
             )
         
         # Convert temperature to float
         try:
             temp = float(matching_temp["value"])
-        except (ValueError, TypeError) as e:
-            return False, None, f"Could not convert temperature to float: {e}"
+        except (ValueError, TypeError):
+            return False, None, f"{city_name}: Could not parse temperature value"
         
         # Sanity check
         if temp < -50 or temp > 50:
-            return False, None, f"Temperature {temp}°C is unrealistic (range: -50 to 50)"
+            return False, None, f"{city_name}: Temperature {temp}°C is unrealistic (range: -50 to 50)"
         
-        logger.info(f"✓ SMHI validation passed: Temperature={temp}°C for hour {target_hour:02d}")
+        logger.info(f"✓ {city_name} temperature: {temp}°C")
         return True, temp, None
         
+    except requests.exceptions.Timeout:
+        return False, None, f"{city_name}: API timeout (>{SMHI_TIMEOUT}s)"
+    except requests.exceptions.ConnectionError:
+        return False, None, f"{city_name}: Connection failed"
+    except requests.exceptions.HTTPError as e:
+        return False, None, f"{city_name}: HTTP {e.response.status_code}"
+    except requests.exceptions.JSONDecodeError:
+        return False, None, f"{city_name}: Invalid JSON response"
     except Exception as e:
-        return False, None, f"Unexpected SMHI validation error: {str(e)}"
+        return False, None, f"{city_name}: {str(e)}"
 
 
 def fetch_svk_data(target_time):
@@ -195,7 +209,7 @@ def fetch_svk_data(target_time):
         }
         
         response = requests.get(SVK_API_URL, params=params, timeout=SVK_TIMEOUT)
-        response.raise_for_status()  # Raise HTTPError for bad status
+        response.raise_for_status()
         
         response_data = response.json()
         is_valid, load, losses, error_msg = validate_svk_response(response_data, target_time)
@@ -210,44 +224,42 @@ def fetch_svk_data(target_time):
     except requests.exceptions.ConnectionError:
         return False, None, None, "SVK API connection failed. Service may be down."
     except requests.exceptions.HTTPError as e:
-        return False, None, None, f"SVK API HTTP error: {e.response.status_code} {e.response.reason}"
+        return False, None, None, f"SVK API HTTP error: {e.response.status_code}"
     except requests.exceptions.JSONDecodeError:
         return False, None, None, "SVK API response is not valid JSON"
     except Exception as e:
         return False, None, None, f"Unexpected SVK fetch error: {str(e)}"
 
 
-def fetch_smhi_data(target_time):
+def fetch_all_city_temperatures(target_time):
     """
-    Fetch and validate SMHI temperature data.
+    Fetch temperatures for all 5 cities from their respective SMHI stations.
+    Uses parallel-like approach for efficiency.
     
     Returns:
-        tuple: (success: bool, temperature: float, error_msg: str)
+        tuple: (success: bool, temps_dict: dict, error_messages: list)
     """
-    try:
-        logger.info(f"Fetching SMHI data for hour {target_time.hour:02d}")
+    temps = {}
+    errors = []
+    
+    for city_name, city_info in CITIES.items():
+        success, temp, error_msg = fetch_smhi_city_temperature(
+            city_name, 
+            city_info["station_id"],
+            target_time
+        )
         
-        response = requests.get(SMHI_API_URL, timeout=SMHI_TIMEOUT)
-        response.raise_for_status()
-        
-        response_data = response.json()
-        is_valid, temp, error_msg = validate_smhi_response(response_data, target_time)
-        
-        if not is_valid:
-            return False, None, f"SMHI data validation failed: {error_msg}"
-        
-        return True, temp, None
-        
-    except requests.exceptions.Timeout:
-        return False, None, f"SMHI API timeout (>{SMHI_TIMEOUT}s). Check network connection."
-    except requests.exceptions.ConnectionError:
-        return False, None, "SMHI API connection failed. Service may be down."
-    except requests.exceptions.HTTPError as e:
-        return False, None, f"SMHI API HTTP error: {e.response.status_code} {e.response.reason}"
-    except requests.exceptions.JSONDecodeError:
-        return False, None, "SMHI API response is not valid JSON"
-    except Exception as e:
-        return False, None, f"Unexpected SMHI fetch error: {str(e)}"
+        if success:
+            temps[city_info["temp_col"]] = temp
+        else:
+            errors.append(error_msg)
+            # Use fallback value if fetch fails
+            temps[city_info["temp_col"]] = 15.0
+    
+    # Overall success if all temperatures were fetched
+    overall_success = len(errors) == 0
+    
+    return overall_success, temps, errors
 
 
 # ==================== STREAMLIT UI ====================
@@ -286,8 +298,8 @@ if mode == "Simulering (Offline Dummy)":
     actual_losses = st.sidebar.slider("Measured Grid Losses (MWh)", 50, 400, 180)
     
     temps = {}
-    for city, var_name in CITIES.items():
-        temps[var_name] = st.sidebar.slider(city, -10, 30, 15)
+    for city_name, city_info in CITIES.items():
+        temps[city_info["temp_col"]] = st.sidebar.slider(city_name, -10, 30, 15)
     
     target_time = datetime.now()
     st.sidebar.success("✓ Offline mode: Using manual slider values")
@@ -313,26 +325,29 @@ else:
         st.sidebar.warning("⚠️ Falling back to dummy values (offline mode)")
         live_load, actual_losses = 5000, 150
     
-    # Fetch SMHI Data
-    smhi_success, smhi_temp, smhi_error = fetch_smhi_data(target_time)
+    # Fetch temperatures for ALL cities from their respective SMHI stations
+    smhi_success, temps, smhi_errors = fetch_all_city_temperatures(target_time)
     
     if smhi_success:
-        # Apply same temperature to all cities (MVP limitation noted)
-        temps = {var_name: smhi_temp for var_name in CITIES.values()}
-        st.sidebar.success(f"✓ SMHI data loaded (Temp: {smhi_temp}°C)")
+        st.sidebar.success("✓ All 5 city temperatures loaded from SMHI")
+        # Display each city's temperature
+        for city_name, city_info in CITIES.items():
+            temp_col = city_info["temp_col"]
+            temp_val = temps.get(temp_col, "N/A")
+            st.sidebar.write(f"  • {city_name}: {temp_val}°C")
     else:
-        st.sidebar.error(f"❌ SMHI API Error: {smhi_error}")
-        st.sidebar.warning("⚠️ Falling back to dummy values")
-        temps = {var_name: 15 for var_name in CITIES.values()}
+        st.sidebar.warning("⚠️ Some SMHI requests failed, using fallback values:")
+        for error in smhi_errors:
+            st.sidebar.warning(f"  • {error}")
 
 # ==================== FEATURE ENGINEERING ====================
 live_features = pd.DataFrame([{
     "totalLoadMwh": live_load,
-    "temp_Gavle": temps.get("t_gavle", 15),
-    "temp_Stockholm": temps.get("t_sthlm", 15),
-    "temp_Vasteras": temps.get("t_vasteras", 15),
-    "temp_Orebro": temps.get("t_orebro", 15),
-    "temp_Jonkoping": temps.get("t_jonkoping", 15),
+    "temp_Gavle": temps.get("temp_Gavle", 15),
+    "temp_Stockholm": temps.get("temp_Stockholm", 15),
+    "temp_Vasteras": temps.get("temp_Vasteras", 15),
+    "temp_Orebro": temps.get("temp_Orebro", 15),
+    "temp_Jonkoping": temps.get("temp_Jonkoping", 15),
     "hour": target_time.hour,
     "month": target_time.month,
     "day_of_week": target_time.weekday(),
@@ -364,30 +379,42 @@ def render_status_dot(status):
     else:
         return "🔴 **ANOMALY DETECTED** - Maintenance needed!"
 
-# Determine regional status
+# Determine regional status based on temperature deviations
 stader_status = {city: "NORMAL" for city in CITIES.keys()}
 
 if abs(residual) > ANOMALY_THRESHOLD:
     temp_values = list(temps.values())
-    # Find city with highest temperature deviation
+    # Find city with highest temperature deviation from mean
     if len(set(temp_values)) > 1:
         mean_temp = np.mean(temp_values)
-        max_dev_idx = np.argmax([abs(t - mean_temp) for t in temp_values])
+        deviations = [abs(t - mean_temp) for t in temp_values]
+        max_dev_idx = np.argmax(deviations)
         anomaly_city = list(CITIES.keys())[max_dev_idx]
         stader_status[anomaly_city] = "ANOMALY"
-        logger.warning(f"Anomaly detected in {anomaly_city}: residual={residual:.1f} MWh")
+        logger.warning(f"Anomaly detected in {anomaly_city}: residual={residual:.1f} MWh (temp deviation: {deviations[max_dev_idx]:.1f}°C)")
     else:
-        # All temperatures same, mark highest deviation city
-        stader_status["Stockholm"] = "ANOMALY"
+        # All temperatures same, mark Stockholm as reference
+        stader_status["Stockholm"] = "WARNING"
 
-# Display regional status
+# Display regional status with individual temperatures and status
 c1, c2, c3, c4, c5 = st.columns(5)
 city_list = list(CITIES.keys())
-with c1: st.markdown(f"### {city_list[0]}\n{render_status_dot(stader_status[city_list[0]])}")
-with c2: st.markdown(f"### {city_list[1]}\n{render_status_dot(stader_status[city_list[1]])}")
-with c3: st.markdown(f"### {city_list[2]}\n{render_status_dot(stader_status[city_list[2]])}")
-with c4: st.markdown(f"### {city_list[3]}\n{render_status_dot(stader_status[city_list[3]])}")
-with c5: st.markdown(f"### {city_list[4]}\n{render_status_dot(stader_status[city_list[4]])}")
+
+with c1: 
+    temp = temps.get(CITIES[city_list[0]]["temp_col"], 15)
+    st.markdown(f"### {city_list[0]}\n**{temp:.1f}°C**\n{render_status_dot(stader_status[city_list[0]])}")
+with c2: 
+    temp = temps.get(CITIES[city_list[1]]["temp_col"], 15)
+    st.markdown(f"### {city_list[1]}\n**{temp:.1f}°C**\n{render_status_dot(stader_status[city_list[1]])}")
+with c3: 
+    temp = temps.get(CITIES[city_list[2]]["temp_col"], 15)
+    st.markdown(f"### {city_list[2]}\n**{temp:.1f}°C**\n{render_status_dot(stader_status[city_list[2]])}")
+with c4: 
+    temp = temps.get(CITIES[city_list[3]]["temp_col"], 15)
+    st.markdown(f"### {city_list[3]}\n**{temp:.1f}°C**\n{render_status_dot(stader_status[city_list[3]])}")
+with c5: 
+    temp = temps.get(CITIES[city_list[4]]["temp_col"], 15)
+    st.markdown(f"### {city_list[4]}\n**{temp:.1f}°C**\n{render_status_dot(stader_status[city_list[4]])}")
 
 # ==================== DEBUG INFO ====================
 with st.expander("🔧 Debug Info"):
@@ -396,5 +423,10 @@ with st.expander("🔧 Debug Info"):
     st.write(f"**Anomaly Threshold:** {ANOMALY_THRESHOLD} MWh")
     st.write(f"**Current Residual:** {residual:.2f} MWh")
     st.write(f"**Status:** {'🔴 ANOMALY' if abs(residual) > ANOMALY_THRESHOLD else '🟢 NORMAL'}")
+    
+    st.write("\n**Temperature Data Sources:**")
+    for city_name, city_info in CITIES.items():
+        st.write(f"  • {city_name}: Station ID {city_info['station_id']}")
+    
     st.write("\n**Features used for prediction:**")
     st.dataframe(live_features)
