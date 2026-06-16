@@ -3,7 +3,8 @@ import pandas as pd
 import numpy as np
 import requests
 from xgboost import XGBRegressor
-from datetime import datetime, timedelta
+# 1. UTÖKAD IMPORT: Lägg till 'timezone' här för att fixa varningen
+from datetime import datetime, timedelta, timezone
 import xml.etree.ElementTree as ET
 import logging
 
@@ -99,7 +100,6 @@ def fetch_live_temperature(city_name, lat, lon, target_time):
         if target_hour_str in times:
             idx = times.index(target_hour_str)
             temp_val = float(hourly_data.get("temperature_2m")[idx])
-            # Gör om Open-Meteos tid till läsbar display-tid
             verified_time = datetime.strptime(times[idx], "%Y-%m-%dT%H:%M").strftime("%Y-%m-%d %H:%M UTC")
             return True, temp_val, verified_time, None
         else:
@@ -112,7 +112,8 @@ def fetch_live_temperature(city_name, lat, lon, target_time):
 
 
 # ==================== CHRONOLOGICAL LOCKING CALCULATOR ====================
-current_utc = datetime.utcnow()
+# 2. FIX: Ändrat från datetime.utcnow() till tidszonsmedveten datetime.now(timezone.utc)
+current_utc = datetime.now(timezone.utc)
 delayed_time = current_utc - timedelta(hours=DATA_LOOKBACK_HOURS)
 target_time = delayed_time.replace(minute=0, second=0, microsecond=0)
 
@@ -141,12 +142,10 @@ except Exception as e:
 st.sidebar.header("🕹️ Kontrollpanel")
 mode = st.sidebar.radio("Välj körläge:", ["Simulering (Offline Dummy)", "Skarpt Live-läge (API)"])
 
-# Initiera variabler och tidsloggar
 live_load = 5400.0
 measured_losses = 150.0
 temps = {c["temp_col"]: 15.0 for c in CITIES.values()}
 
-# Ordböcker för att hålla reda på källor/tider per datapunkt
 temp_timestamps = {}
 grid_timestamp = "Simulerat läge"
 
@@ -256,7 +255,6 @@ if abs(residual) > ANOMALY_THRESHOLD:
     deviations = {city: abs(temps[info["temp_col"]] - temp_mean) for city, info in CITIES.items()}
     stader_status[max(deviations, key=deviations.get)] = "CRITICAL"
 
-# Rita upp de 5 städerna i kolumner med tillhörande tidsstämplar
 columns = st.columns(5)
 for idx, (city_name, city_info) in enumerate(CITIES.items()):
     with columns[idx]:
