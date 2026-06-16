@@ -57,17 +57,25 @@ def fetch_live_entsoe_data(target_time):
 
 def fetch_entsoe_load_forecast(forecast_date):
     """
-    Hämtar morgondagens planerade elbehov för BZN SE3.
-    Matchar exakt ENTSO-E:s publika webbkurva (7100 - 8600+ MW).
+    Hämtar planerade elbehovet för BZN SE3.
+    Testar först på landsnivå om elområdesnivå saknar TimeSeries.
     """
+    current_utc_hour = datetime.now(timezone.utc).hour
+    today_date = datetime.now(timezone.utc).date()
+    
+    if forecast_date > today_date and current_utc_hour < 10:
+        logger.warning(f"⚠️ Klockan är före 10:00 UTC. Hämtar dagens prognos istället.")
+        forecast_date = today_date
+
     start_str = forecast_date.strftime("%Y%m%d0000")
     end_str = (forecast_date + timedelta(days=1)).strftime("%Y%m%d0000")
     
+    # Vi testar att köra med DOMAIN_SVERIGE eftersom realtidsdatan krävde den!
     params = {
         "securityToken": API_KEY,
-        "documentType": "A69",         # Day-Ahead Total Load Forecast
-        "processType": "A01",          # Day Ahead
-        "In_Domain": DOMAIN_SE3,       # Använder SE3 EIC-kod för rätt kurva
+        "documentType": "A69",         
+        "processType": "A01",          
+        "In_Domain": DOMAIN_SVERIGE,   # <-- Ändrat till Sverige-koden ("10YSE-1--------K")
         "periodStart": start_str,
         "periodEnd": end_str
     }
@@ -80,17 +88,23 @@ def fetch_entsoe_load_forecast(forecast_date):
         root = ET.fromstring(r.content)
         ns = {"ns": root.tag.split('}')[0].strip('{')}
         
+        reason = root.find(".//ns:Reason/ns:text", ns)
+        if reason is not None:
+            return False, None, f"API: {reason.text}"
+
         time_series_list = root.findall(".//ns:TimeSeries", ns)
+        
+        # FELSÖKNINGS-PRINT: Om det fortfarande är tomt, printa XML i terminalen så vi ser felet
         if not time_series_list:
+            logger.error("--- ENTSO-E SVARADE UTAN TIMESERIES. RÅ XML NEDAN ---")
+            logger.error(r.text[:1000]) # Printar de första 1000 tecknen av svaret i din konsol
             return False, None, "Ingen TimeSeries funnen i XML."
             
         candidate_series = []
-        
         for ts in time_series_list:
             period = ts.find("ns:Period", ns)
             if period is not None:
                 points = period.findall("ns:Point", ns)
-                
                 series_dict = {}
                 for p in points:
                     pos_node = p.find("ns:position", ns)
@@ -99,37 +113,28 @@ def fetch_entsoe_load_forecast(forecast_date):
                         series_dict[int(pos_node.text)] = float(qty_node.text)
                 
                 if series_dict:
-                    if len(series_dict) == 96:
+                    if len(series_dict) == 96: 
                         hourly_dict = {}
                         for hour in range(24):
                             q_values = [series_dict[p] for p in range(hour*4 + 1, hour*4 + 5) if p in series_dict]
-                            if q_values:
-                                hourly_dict[hour + 1] = float(np.mean(q_values))
+                            if q_values: hourly_dict[hour + 1] = float(np.mean(q_values))
                         series_dict = hourly_dict
                     
                     if len(series_dict) >= 24:
                         sorted_hours = sorted(series_dict.keys())
                         ordered_values = [series_dict[h] for h in sorted_hours[:24]]
                         mean_volume = np.mean(ordered_values)
-                        
-                        candidate_series.append({
-                            "values": ordered_values,
-                            "mean_volume": mean_volume
-                        })
+                        candidate_series.append({"values": ordered_values, "mean_volume": mean_volume})
         
         if not candidate_series:
             return False, None, "Hittade inga kompletta prognosserier."
-            
+        
         candidate_series.sort(key=lambda x: x["mean_volume"], reverse=True)
-        best_match_values = candidate_series[0]["values"]
-        
-        logger.info(f"🎉 Hämtat fullständig systemprognos för SE3. Medel: {candidate_series[0]['mean_volume']:.1f} MW")
-        return True, best_match_values, None
-        
+        logger.info(f"🎉 Hämtat prognos för {forecast_date}. Medel: {candidate_series[0]['mean_volume']:.1f} MW")
+        return True, candidate_series[0]["values"], None
     except Exception as e: 
         return False, None, str(e)
-
-
+        
 def fetch_live_temperature(city_name, lat, lon, target_time):
     """Hämtar historisk/realtidstemp för en specifik timme via Archive-API."""
     try:
