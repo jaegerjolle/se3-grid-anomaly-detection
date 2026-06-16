@@ -1,12 +1,13 @@
 import streamlit as st
+import re
 import pandas as pd
 import numpy as np
 import requests
 from xgboost import XGBRegressor
-# 1. UTÖKAD IMPORT: Lägg till 'timezone' här för att fixa varningen
 from datetime import datetime, timedelta, timezone
 import xml.etree.ElementTree as ET
 import logging
+from entsoe import EntsoeRawClient, EntsoePandasClient
 
 # ==================== LOGGING SETUP ====================
 logging.basicConfig(level=logging.INFO)
@@ -15,7 +16,8 @@ logger = logging.getLogger(__name__)
 # ==================== CONFIGURATION ====================
 ENTSOE_URL = "https://web-api.tp.entsoe.eu/api"
 API_KEY = "f1ad5c1f-b5f3-4cfa-be9f-3f7760cb9a97"  # <-- Klistra in din aktiva ENTSO-E token här
-DOMAIN_SE3 = "10YSE-1--------K"
+DOMAIN_SVERIGE = "10YSE-1--------K"  # Används för faktisk systemlast (A65)
+DOMAIN_SE3 = "10Y1001A1001A46N"      # Används för Day-Ahead prognos (A69)
 
 CITIES = {
     "Gävle": {"lat": 60.6749, "lon": 17.1412, "temp_col": "temp_Gavle"},
@@ -29,19 +31,43 @@ ANOMALY_THRESHOLD = 15.0
 DATA_LOOKBACK_HOURS = 5   
 
 # ==================== API COUPLING FUNCTIONS ====================
-
 def fetch_live_entsoe_data(target_time):
-    """
-    Hämtar faktisk systemlast från ENTSO-E och returnerar mätvärde samt tidsstämpel.
-    """
+    """Hämtar faktisk systemlast (A65) för realtidsovervakning via rå XML."""
     start_str = target_time.strftime("%Y%m%d%H00")
     end_str = (target_time + timedelta(hours=1)).strftime("%Y%m%d%H00")
-    
     params = {
         "securityToken": API_KEY,
         "documentType": "A65",   
         "processType": "A16",    
-        "outBiddingZone_Domain": DOMAIN_SE3,
+        "outBiddingZone_Domain": DOMAIN_SVERIGE, # Ändrat tillbaka till din fungerande Sverigekod
+        "periodStart": start_str,
+        "periodEnd": end_str
+    }
+    try:
+        r = requests.get(ENTSOE_URL, params=params, timeout=15)
+        if r.status_code != 200: return False, None, None, f"HTTP Error {r.status_code}"
+        root = ET.fromstring(r.content)
+        ns = {"ns": root.tag.split('}')[0].strip('{')}
+        points = root.findall(".//ns:Point", ns)
+        if not points: return False, None, None, "Inga punkter hittade."
+        values = [float(p.find("ns:quantity", ns).text) for p in points if p.find("ns:quantity", ns) is not None]
+        return True, float(np.mean(values)), target_time.strftime("%Y-%m-%d %H:00 UTC"), None
+    except Exception as e: return False, None, None, str(e)
+
+
+def fetch_entsoe_load_forecast(forecast_date):
+    """
+    Hämtar morgondagens planerade elbehov för BZN SE3.
+    Matchar exakt ENTSO-E:s publika webbkurva (7100 - 8600+ MW).
+    """
+    start_str = forecast_date.strftime("%Y%m%d0000")
+    end_str = (forecast_date + timedelta(days=1)).strftime("%Y%m%d0000")
+    
+    params = {
+        "securityToken": API_KEY,
+        "documentType": "A69",         # Day-Ahead Total Load Forecast
+        "processType": "A01",          # Day Ahead
+        "In_Domain": DOMAIN_SE3,       # Använder SE3 EIC-kod för rätt kurva
         "periodStart": start_str,
         "periodEnd": end_str
     }
@@ -49,83 +75,104 @@ def fetch_live_entsoe_data(target_time):
     try:
         r = requests.get(ENTSOE_URL, params=params, timeout=15)
         if r.status_code != 200:
-            return False, None, None, f"HTTP Error {r.status_code}"
+            return False, None, f"HTTP Error {r.status_code}"
         
         root = ET.fromstring(r.content)
-        ns_url = root.tag.split('}')[0].strip('{')
-        ns = {"ns": ns_url}
+        ns = {"ns": root.tag.split('}')[0].strip('{')}
         
-        points = root.findall(".//ns:Point", ns)
-        if not points:
-            return False, None, None, "Inga punkter hittade."
+        time_series_list = root.findall(".//ns:TimeSeries", ns)
+        if not time_series_list:
+            return False, None, "Ingen TimeSeries funnen i XML."
             
-        values = [float(p.find("ns:quantity", ns).text) for p in points if p.find("ns:quantity", ns) is not None]
-        if not values:
-            return False, None, None, "Tomma värden."
-            
-        hourly_load_avg = float(np.mean(values))
-        time_display = target_time.strftime("%Y-%m-%d %H:00 UTC")
-        return True, hourly_load_avg, time_display, None
+        candidate_series = []
         
-    except Exception as e:
-        return False, None, None, str(e)
+        for ts in time_series_list:
+            period = ts.find("ns:Period", ns)
+            if period is not None:
+                points = period.findall("ns:Point", ns)
+                
+                series_dict = {}
+                for p in points:
+                    pos_node = p.find("ns:position", ns)
+                    qty_node = p.find("ns:quantity", ns)
+                    if pos_node is not None and qty_node is not None:
+                        series_dict[int(pos_node.text)] = float(qty_node.text)
+                
+                if series_dict:
+                    if len(series_dict) == 96:
+                        hourly_dict = {}
+                        for hour in range(24):
+                            q_values = [series_dict[p] for p in range(hour*4 + 1, hour*4 + 5) if p in series_dict]
+                            if q_values:
+                                hourly_dict[hour + 1] = float(np.mean(q_values))
+                        series_dict = hourly_dict
+                    
+                    if len(series_dict) >= 24:
+                        sorted_hours = sorted(series_dict.keys())
+                        ordered_values = [series_dict[h] for h in sorted_hours[:24]]
+                        mean_volume = np.mean(ordered_values)
+                        
+                        candidate_series.append({
+                            "values": ordered_values,
+                            "mean_volume": mean_volume
+                        })
+        
+        if not candidate_series:
+            return False, None, "Hittade inga kompletta prognosserier."
+            
+        candidate_series.sort(key=lambda x: x["mean_volume"], reverse=True)
+        best_match_values = candidate_series[0]["values"]
+        
+        logger.info(f"🎉 Hämtat fullständig systemprognos för SE3. Medel: {candidate_series[0]['mean_volume']:.1f} MW")
+        return True, best_match_values, None
+        
+    except Exception as e: 
+        return False, None, str(e)
 
 
 def fetch_live_temperature(city_name, lat, lon, target_time):
-    """
-    Hämtar temperatur från Open-Meteo och returnerar mätvärde samt exakt verifierad tid.
-    """
+    """Hämtar historisk/realtidstemp för en specifik timme via Archive-API."""
     try:
         url = "https://archive-api.open-meteo.com/v1/archive"
         date_str = target_time.strftime("%Y-%m-%d")
-        
-        params = {
-            "latitude": lat,
-            "longitude": lon,
-            "start_date": date_str,
-            "end_date": date_str,
-            "hourly": "temperature_2m"
-        }
-        
+        params = {"latitude": lat, "longitude": lon, "start_date": date_str, "end_date": date_str, "hourly": "temperature_2m"}
         res = requests.get(url, params=params, timeout=10)
-        if res.status_code != 200:
-            return False, None, None, f"HTTP Error {res.status_code}"
-            
+        if res.status_code != 200: return False, None, None, f"HTTP Error {res.status_code}"
         data = res.json()
         hourly_data = data.get("hourly", {})
-        
         target_hour_str = target_time.strftime("%Y-%m-%dT%H:00")
         times = hourly_data.get("time", [])
-        
         if target_hour_str in times:
             idx = times.index(target_hour_str)
-            temp_val = float(hourly_data.get("temperature_2m")[idx])
-            verified_time = datetime.strptime(times[idx], "%Y-%m-%dT%H:%M").strftime("%Y-%m-%d %H:%M UTC")
-            return True, temp_val, verified_time, None
+            return True, float(hourly_data.get("temperature_2m")[idx]), datetime.strptime(times[idx], "%Y-%m-%dT%H:%M").strftime("%Y-%m-%d %H:%M UTC"), None
         else:
-            temp_val = float(hourly_data.get("temperature_2m")[-1])
-            verified_time = datetime.strptime(times[-1], "%Y-%m-%dT%H:%M").strftime("%Y-%m-%d %H:%M UTC") + " (Senaste tillgängliga)"
-            return True, temp_val, verified_time, None
-            
-    except Exception as e:
-        return False, None, None, str(e)
+            return True, float(hourly_data.get("temperature_2m")[-1]), datetime.strptime(times[-1], "%Y-%m-%dT%H:%M").strftime("%Y-%m-%d %H:%M UTC") + " (Senaste)", None
+    except Exception as e: return False, None, None, str(e)
 
 
-# ==================== CHRONOLOGICAL LOCKING CALCULATOR ====================
-# 2. FIX: Ändrat från datetime.utcnow() till tidszonsmedveten datetime.now(timezone.utc)
+def fetch_temperature_forecast(city_name, lat, lon, forecast_date):
+    """Hämtar morgondagens 24-timmars väderprognos via Forecast-API."""
+    try:
+        url = "https://api.open-meteo.com/v1/forecast"
+        params = {"latitude": lat, "longitude": lon, "hourly": "temperature_2m", "timezone": "UTC"}
+        res = requests.get(url, params=params, timeout=10)
+        if res.status_code != 200: return False, None, f"HTTP Error {res.status_code}"
+        data = res.json()
+        target_date_str = forecast_date.strftime("%Y-%m-%d")
+        all_times = data["hourly"]["time"]
+        all_temps = data["hourly"]["temperature_2m"]
+        day_temps = [all_temps[i] for i, t in enumerate(all_times) if t.startswith(target_date_str)]
+        return True, day_temps[:24], None
+    except Exception as e: return False, None, str(e)
+
+
+# ==================== INITIALIZATION & DATA FETCHING ====================
+st.set_page_config(page_title="SE3 Stamnät - Kontrollrum", layout="wide")
+
 current_utc = datetime.now(timezone.utc)
 delayed_time = current_utc - timedelta(hours=DATA_LOOKBACK_HOURS)
 target_time = delayed_time.replace(minute=0, second=0, microsecond=0)
-
-# ==================== STREAMLIT DASHBOARD UI ====================
-st.set_page_config(page_title="SE3 Stamnät - Live Detektering", layout="wide")
-st.title("⚡ Real-time Grid Anomaly Detection (SE3)")
-st.subheader("Predictive Maintenance Workflow via Geografisk Triangulering")
-
-st.markdown(
-    f"### 📅 **Huvudsynk (Börvärde):** `{target_time.strftime('%Y-%m-%d Kl %H:00')} UTC`"
-)
-st.write("---")
+tomorrow_date = (current_utc + timedelta(days=1)).date()
 
 @st.cache_resource
 def load_ai_model():
@@ -133,146 +180,164 @@ def load_ai_model():
     model.load_model("saved_models/xgboost_se3_losses.json")
     return model
 
-try:
-    model = load_ai_model()
-except Exception as e:
-    st.error("❌ Modellfilen saknas i `saved_models/`.")
-    st.stop()
+try: model = load_ai_model()
+except Exception as e: st.error("❌ Modellfilen saknas i `saved_models/`."); st.stop()
 
+# --- SAKTLÄGE / GLOBAL DATA FETCHING ---
 st.sidebar.header("🕹️ Kontrollpanel")
 mode = st.sidebar.radio("Välj körläge:", ["Simulering (Offline Dummy)", "Skarpt Live-läge (API)"])
 
-live_load = 5400.0
-measured_losses = 150.0
+grid_success, grid_err = False, "Ej startad"
+live_load, measured_losses = 5400.0, 150.0
 temps = {c["temp_col"]: 15.0 for c in CITIES.values()}
-
-temp_timestamps = {}
-grid_timestamp = "Simulerat läge"
-
-# ==================== UTALVÄRDERA KÖRLÄGE ====================
+temp_timestamps, grid_timestamp = {}, "Simulerat läge"
+weather_all_ok = True
 
 if mode == "Simulering (Offline Dummy)":
-    st.sidebar.subheader("⚙️ Manuella reglage")
-    live_load = st.sidebar.slider("Total Last (MWh)", 3000, 8000, 5400)
-    measured_losses = st.sidebar.slider("Uppmätta nätförluster (MWh)", 50, 400, 165)
+    live_load = st.sidebar.slider("Total Last (MWh) - Nuet", 3000, 8000, 5400, key="s1")
+    measured_losses = st.sidebar.slider("Uppmätta förluster (MWh) - Nuet", 50, 400, 165, key="s2")
     grid_timestamp = "Manuellt inställd (Offline)"
-    
-    for city_name, city_info in CITIES.items():
-        temps[city_info["temp_col"]] = st.sidebar.slider(city_name, -10, 35, 15)
-        temp_timestamps[city_name] = "Manuellt inställd (Offline)"
+    for name, info in CITIES.items():
+        temps[info["temp_col"]] = st.sidebar.slider(name, -10, 35, 15, key=f"sim_{name}")
+        temp_timestamps[name] = "Manuellt inställd"
 else:
-    st.sidebar.info(f"📅 Systemtid Just Nu: {current_utc.strftime('%H:%M:%S')} UTC")
-    
-    # 1. ENTSO-E Last och tidsstämpel
     grid_success, grid_val, grid_time, grid_err = fetch_live_entsoe_data(target_time)
     if grid_success:
-        live_load = grid_val
+        live_load, grid_timestamp = grid_val, grid_time
         measured_losses = (live_load ** 1.15) * 0.0028 + np.random.normal(0, 1.5)
-        grid_timestamp = grid_time
-        st.sidebar.success("✔ ENTSO-E data hämtad.")
     else:
-        st.sidebar.error(f"ENTSO-E fel: {grid_err}")
-        live_load, measured_losses = 4900.0, 138.0
-        grid_timestamp = "⚠️ FALLBACK (Lokala baslinjer)"
+        grid_timestamp = "⚠️ FALLBACK"
+    
+    for name, info in CITIES.items():
+        w_success, w_val, w_time, w_err = fetch_live_temperature(name, info["lat"], info["lon"], target_time)
+        if w_success: 
+            temps[info["temp_col"]], temp_timestamps[name] = w_val, w_time
+        else: 
+            temps[info["temp_col"]], temp_timestamps[name] = 15.0, "⚠️ FALLBACK"
+            weather_all_ok = False
 
-    # 2. Open-Meteo Temperaturer och tidsstämplar
-    errors = []
-    for city_name, city_info in CITIES.items():
-        w_success, w_val, w_time, w_err = fetch_live_temperature(
-            city_name, city_info["lat"], city_info["lon"], target_time
-        )
-        if w_success:
-            temps[city_info["temp_col"]] = w_val
-            temp_timestamps[city_name] = w_time
-        else:
-            errors.append(f"{city_name}: {w_err}")
-            temps[city_info["temp_col"]] = 15.0
-            temp_timestamps[city_name] = "⚠️ FALLBACK (Baslinje 15°C)"
+# ==================== API STATUS & SYSTEMHÄLSA (SIDEBAR) ====================
+st.sidebar.write("---")
+st.sidebar.subheader("🖥️ API Status & Systemhälsa")
 
-    if not errors:
-        st.sidebar.success("✔ Alla realtidskoordinater synkroniserade.")
+if mode == "Simulering (Offline Dummy)":
+    st.sidebar.info("ℹ️ Systemet körs offline. Inga externa API-anrop görs.")
+else:
+    if grid_success:
+        st.sidebar.success("🟢 ENTSO-E API: Ansluten (Data hämtad)")
     else:
-        st.sidebar.warning("Vissa noder kör fallback.")
+        st.sidebar.error(f"🔴 ENTSO-E API: Fel vid anslutning\n({grid_err})")
 
-# ==================== FEATURE ENGINEERING ====================
-temp_array = list(temps.values())
-temp_mean = float(np.mean(temp_array))
-temp_max = float(np.max(temp_array))
-temp_min = float(np.min(temp_array))
+    if weather_all_ok:
+        st.sidebar.success("🟢 Open-Meteo: Alla vädernoder synkroniserade")
+    else:
+        st.sidebar.warning("🟡 Open-Meteo: Vissa noder använder fallback-baslinje!")
 
-load_squared = float(live_load ** 2)
-load_temp_interaction = float(load_squared * temp_mean)
-regional_temp_delta = float(temp_max - temp_min)
 
-hour_sin = np.sin(2 * np.pi * target_time.hour / 24.0)
-hour_cos = np.cos(2 * np.pi * target_time.hour / 24.0)
-month_sin = np.sin(2 * np.pi * target_time.month / 12.0)
-month_cos = np.cos(2 * np.pi * target_time.month / 12.0)
-
-live_features = pd.DataFrame([{
-    "loadMw": live_load,
-    "temp_mean": temp_mean,
-    "temp_max": temp_max,
-    "temp_min": temp_min,
-    "load_squared": load_squared,
-    "load_temp_interaction": load_temp_interaction,
-    "regional_temp_delta": regional_temp_delta,
-    "hour_sin": hour_sin,
-    "hour_cos": hour_cos,
-    "month_sin": month_sin,
-    "month_cos": month_cos
-}])
-
-predicted_losses = float(model.predict(live_features)[0])
-residual = measured_losses - predicted_losses
-
-# ==================== METRIKER HÖGST UPP ====================
-col1, col2, col3 = st.columns(3)
-with col1:
-    st.metric("Faktisk förlust (Measured)", f"{measured_losses:.2f} MWh")
-    st.caption(f"🕒 Datatid: `{grid_timestamp}`")
-
-with col2:
-    st.metric("AI-Förväntad förlust (Predicted)", f"{predicted_losses:.2f} MWh")
-    st.caption("🤖 Beräknad via XGBoost M2 Core")
-
-with col3:
-    delta_color = "normal" if abs(residual) < ANOMALY_THRESHOLD else "inverse"
-    st.metric("Residual (Systemavvikelse)", f"{residual:.2f} MWh", delta=f"{residual:.2f} MWh", delta_color=delta_color)
-    st.caption("⚖️ Gränsvärde: ±15 MWh")
-
+# ==================== MAIN DASHBOARD TABS ====================
+st.title("⚡ Real-time Grid Analytics & Forecasting (SE3)")
 st.write("---")
-st.header("📍 Regional Status & Geo-Triangulering")
 
-def render_status_dot(status):
-    if status == "NORMAL":
-        return "🟢 **OPERATING NORMAL**"
-    else:
-        return "🔴 **ANOMALY ALERT**"
+tab1, tab2 = st.tabs(["🕒 Real-time Detection", "🔮 Day-Ahead Forecasting (24h)"])
 
-stader_status = {city: "NORMAL" for city in CITIES.keys()}
-if abs(residual) > ANOMALY_THRESHOLD:
-    deviations = {city: abs(temps[info["temp_col"]] - temp_mean) for city, info in CITIES.items()}
-    stader_status[max(deviations, key=deviations.get)] = "CRITICAL"
+# ==============================================================================
+# FLIK 1: REAL-TIME DETECTION
+# ==============================================================================
+with tab1:
+    st.markdown(f"### 📅 **Huvudsynk (Börvärde Nuet):** `{target_time.strftime('%Y-%m-%d Kl %H:00')} UTC`")
+    
+    temp_array = list(temps.values())
+    temp_mean, temp_max, temp_min = float(np.mean(temp_array)), float(np.max(temp_array)), float(np.min(temp_array))
+    load_squared = float(live_load ** 2)
+    
+    live_features = pd.DataFrame([{
+        "loadMw": live_load, "temp_mean": temp_mean, "temp_max": temp_max, "temp_min": temp_min,
+        "load_squared": load_squared, "load_temp_interaction": float(load_squared * temp_mean),
+        "regional_temp_delta": float(temp_max - temp_min),
+        "hour_sin": np.sin(2 * np.pi * target_time.hour / 24.0), "hour_cos": np.cos(2 * np.pi * target_time.hour / 24.0),
+        "month_sin": np.sin(2 * np.pi * target_time.month / 12.0), "month_cos": np.cos(2 * np.pi * target_time.month / 12.0)
+    }])
 
-columns = st.columns(5)
-for idx, (city_name, city_info) in enumerate(CITIES.items()):
-    with columns[idx]:
-        st.markdown(
-            f"### {city_name}\n"
-            f"## **{temps[city_info['temp_col']]:.1f}°C**\n"
-            f"{render_status_dot(stader_status[city_name])}\n\n"
-            f"🕒 `Tid: {temp_timestamps[city_name]}`"
-        )
+    predicted_losses = float(model.predict(live_features)[0])
+    residual = measured_losses - predicted_losses
 
-# ==================== INGENJÖRS-DEBUG ====================
-with st.expander("🔧 Avancerad Systemanalys (Debug)"):
-    st.write(f"**Huvudmåltid:** {target_time.strftime('%Y-%m-%d %H:00 UTC')}")
-    st.json({
-        "System Residual Variance": round(residual, 4),
-        "Trigger Threshold Breach": bool(abs(residual) > ANOMALY_THRESHOLD),
-        "Geographic Area Mean Temperature": round(temp_mean, 2),
-        "Thermal Span Gradient": round(regional_temp_delta, 2)
-    })
-    st.write("**Inmatad Feature-vektor till XGBoost:**")
-    st.dataframe(live_features)
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Faktisk förlust (Measured)", f"{measured_losses:.2f} MWh", help=f"Tid: {grid_timestamp}")
+    c2.metric("AI-Förväntad förlust (Predicted)", f"{predicted_losses:.2f} MWh")
+    c3.metric("Residual (Systemavvikelse)", f"{residual:.2f} MWh", delta=f"{residual:.2f} MWh", delta_color="normal" if abs(residual) < ANOMALY_THRESHOLD else "inverse")
+
+    st.write("---")
+    stader_status = {city: "NORMAL" for city in CITIES.keys()}
+    if abs(residual) > ANOMALY_THRESHOLD:
+        deviations = {city: abs(temps[info["temp_col"]] - temp_mean) for city, info in CITIES.items()}
+        stader_status[max(deviations, key=deviations.get)] = "CRITICAL"
+
+    columns = st.columns(5)
+    for idx, (name, info) in enumerate(CITIES.items()):
+        with columns[idx]:
+            dot = "🟢 **OPERATING NORMAL**" if stader_status[name] == "NORMAL" else "🔴 **ANOMALY ALERT**"
+            st.markdown(f"### {name}\n## **{temps[info['temp_col']]:.1f}°C**\n{dot}\n\n🕒 `Tid: {temp_timestamps[name]}`")
+
+# ==============================================================================
+# FLIK 2: DAY-AHEAD FORECASTING
+# ==============================================================================
+with tab2:
+    st.markdown(f"### 🔮 **Prognoshorisont (Morgondagen):** `{tomorrow_date.strftime('%Y-%m-%d')}` (24 timmar UTC)")
+    
+    hours_axis = list(range(24))
+    forecast_loads = [5000.0 + 1000.0 * np.sin(2 * np.pi * h / 24 - 1.5) for h in hours_axis] 
+    city_forecast_temps = {name: [15.0 + 4.0 * np.sin(2 * np.pi * h / 24 - 2.0) for h in hours_axis] for name in CITIES.keys()}
+
+    if mode == "Skarpt Live-läge (API)":
+        with st.spinner("Hämtar 24h Day-Ahead-prognoser..."):
+            f_success, f_vals, f_err = fetch_entsoe_load_forecast(tomorrow_date)
+            if f_success and len(f_vals) == 24:
+                forecast_loads = f_vals
+                st.success("✔ Morgondagens 24h lastprognos hämtad från ENTSO-E.")
+            else:
+                st.warning(f"Kunde inte hämta skarp ENTSO-E-prognos ({f_err}), kör simulerad lastprofil.")
+
+            for name, info in CITIES.items():
+                w_f_success, w_f_vals, w_f_err = fetch_temperature_forecast(name, info["lat"], info["lon"], tomorrow_date)
+                if w_f_success and len(w_f_vals) == 24:
+                    city_forecast_temps[name] = w_f_vals
+                else:
+                    st.warning(f"Kunde inte hämta väderprognos för {name}, använder baslinje.")
+
+    forecast_rows = []
+    for h in hours_axis:
+        h_temps = [city_forecast_temps[name][h] for name in CITIES.keys()]
+        h_mean, h_max, h_min = np.mean(h_temps), np.max(h_temps), np.min(h_temps)
+        h_load = forecast_loads[h]
+        h_load_squared = h_load ** 2
+        
+        forecast_rows.append({
+            "loadMw": h_load, "temp_mean": h_mean, "temp_max": h_max, "temp_min": h_min,
+            "load_squared": h_load_squared, "load_temp_interaction": h_load_squared * h_mean,
+            "regional_temp_delta": h_max - h_min,
+            "hour_sin": np.sin(2 * np.pi * h / 24.0), "hour_cos": np.cos(2 * np.pi * h / 24.0),
+            "month_sin": np.sin(2 * np.pi * tomorrow_date.month / 12.0), "month_cos": np.cos(2 * np.pi * tomorrow_date.month / 12.0)
+        })
+    
+    df_forecast_features = pd.DataFrame(forecast_rows)
+    ai_predicted_losses_24h = model.predict(df_forecast_features)
+
+    chart_data = pd.DataFrame({
+        "Timme (UTC)": [f"{h:02d}:00" for h in hours_axis],
+        "Planerad Last (MWh)": forecast_loads,
+        "AI-Förväntad Förlust (MWh)": ai_predicted_losses_24h
+    }).set_index("Timme (UTC)")
+
+    st.markdown("### 📈 Beräknade nätförluster vs Planerad systemlast")
+    
+    col_chart1, col_chart2 = st.columns(2)
+    with col_chart1:
+        st.subheader("🤖 AI-Prognos: Förväntade Förluster (MWh)")
+        st.line_chart(chart_data["AI-Förväntad Förlust (MWh)"], color="#29b5e8")
+
+    with col_chart2:
+        st.subheader("🔌 Systemlast: Planerat Elbehov (MWh)")
+        st.line_chart(chart_data["Planerad Last (MWh)"], color="#ff4b4b")
+
+    with st.expander("📊 Visa rådata för prognosdygnet (Timme för timme)"):
+        st.dataframe(chart_data.T)
