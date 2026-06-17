@@ -7,7 +7,20 @@ import time
 # -----------------------------
 # CONFIG
 # -----------------------------
-API_KEY = "f1ad5c1f-b5f3-4cfa-be9f-3f7760cb9a97"  # <-- Insert your key here
+def load_api_key():
+    try:
+        # Ändrat från "current_dir" till "r" (read)
+        with open("key.txt", "r") as f:
+            return f.read().strip()
+    except FileNotFoundError:
+        import streamlit as st
+        st.error("❌ Hittade inte 'key.txt'. Se till att filen finns i mappen.")
+        st.stop()
+    # Detta skriver ut nyckelns längd och de första/sista tecknen i din terminal
+    print(f"DEBUG: Nyckelns längd är {len(API_KEY)} tecken.")
+    print(f"DEBUG: Nyckeln börjar med: '{API_KEY[:4]}' och slutar med: '{API_KEY[-4:]}'")
+
+API_KEY = load_api_key()  # Ladda API-nyckeln från fil
 
 domain = "10YSE-1--------K"  # SE3
 url = "https://web-api.tp.entsoe.eu/api"
