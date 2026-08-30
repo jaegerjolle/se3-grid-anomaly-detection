@@ -1,7 +1,7 @@
 import requests
 import pandas as pd
 import xml.etree.ElementTree as ET
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import time
 
 # -----------------------------
@@ -11,16 +11,22 @@ def load_api_key():
     try:
         # Ändrat från "current_dir" till "r" (read)
         with open("key.txt", "r") as f:
-            return f.read().strip()
+            key = f.read().strip()
+            if not key:
+                raise ValueError("key.txt finns men är tom. Lägg in din API-nyckel.")
+            return key
     except FileNotFoundError:
-        import streamlit as st
-        st.error("❌ Hittade inte 'key.txt'. Se till att filen finns i mappen.")
-        st.stop()
-    # Detta skriver ut nyckelns längd och de första/sista tecknen i din terminal
-    print(f"DEBUG: Nyckelns längd är {len(API_KEY)} tecken.")
-    print(f"DEBUG: Nyckeln börjar med: '{API_KEY[:4]}' och slutar med: '{API_KEY[-4:]}'")
+        raise SystemExit("❌ Hittade inte 'key.txt'. Se till att filen finns i mappen.")
+    except Exception as e:
+        raise SystemExit(f"Fel vid inläsning av nyckel: {e}")
 
 API_KEY = load_api_key()  # Ladda API-nyckeln från fil
+
+# Debug: maskerad nyckel (visar inte hela nyckeln)
+try:
+    print(f"DEBUG: Nyckelns längd är {len(API_KEY)} tecken. Börjar med {API_KEY[:4]}... slutar med {API_KEY[-4:]}")
+except Exception:
+    print("DEBUG: Kunde inte visa nyckelns metadata.")
 
 domain = "10YSE-1--------K"  # SE3
 url = "https://web-api.tp.entsoe.eu/api"
@@ -29,12 +35,12 @@ url = "https://web-api.tp.entsoe.eu/api"
 # We split 730 days into two 365-day chunks to get the full 2 years safely.
 chunks = [
     {
-        "start": (datetime.utcnow() - timedelta(days=730)).strftime("%Y%m%d%H%M"),
-        "end": (datetime.utcnow() - timedelta(days=365)).strftime("%Y%m%d%H%M")
+        "start": (datetime.now(timezone.utc) - timedelta(days=730)).strftime("%Y%m%d%H%M"),
+        "end": (datetime.now(timezone.utc) - timedelta(days=365)).strftime("%Y%m%d%H%M")
     },
     {
-        "start": (datetime.utcnow() - timedelta(days=365)).strftime("%Y%m%d%H%M"),
-        "end": datetime.utcnow().strftime("%Y%m%d%H%M")
+        "start": (datetime.now(timezone.utc) - timedelta(days=365)).strftime("%Y%m%d%H%M"),
+        "end": datetime.now(timezone.utc).strftime("%Y%m%d%H%M")
     }
 ]
 

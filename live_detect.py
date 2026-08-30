@@ -2,6 +2,7 @@ import datetime
 import logging
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
+import time
 import numpy as np
 import pandas as pd
 import requests
@@ -50,38 +51,65 @@ DATA_LOOKBACK_HOURS = 5
 
 def fetch_live_entsoe_data(target_time):
     """Hämtar faktisk systemlast (A65) för realtidsovervakning via rå XML."""
-    start_str = target_time.strftime("%Y%m%d%H00")
-    end_str = (target_time + timedelta(hours=1)).strftime("%Y%m%d%H00")
-    params = {
-        "securityToken": API_KEY,
-        "documentType": "A65",
-        "processType": "A16",
-        "outBiddingZone_Domain": DOMAIN_SVERIGE,
-        "periodStart": start_str,
-        "periodEnd": end_str,
-    }
-    try:
-        r = requests.get(ENTSOE_URL, params=params, timeout=15)
-        if r.status_code != 200:
-            return False, None, None, f"HTTP Error {r.status_code}"
-        root = ET.fromstring(r.content)
-        ns = {"ns": root.tag.split("}")[0].strip("{")}
-        points = root.findall(".//ns:Point", ns)
-        if not points:
-            return False, None, None, "Inga punkter hittade."
-        values = [
-            float(p.find("ns:quantity", ns).text)
-            for p in points
-            if p.find("ns:quantity", ns) is not None
-        ]
-        return (
-            True,
-            float(np.mean(values)),
-            target_time.strftime("%Y-%m-%d %H:00 UTC"),
-            None,
-        )
-    except Exception as e:
-        return False, None, None, str(e)
+    # Try the requested hour and fall back up to N previous hours if ENTSO-E
+    # explicitly reports "No matching data". This handles short publication
+    # delays on the transparency API.
+    max_lookback_hours = 6
+    max_retries = 3
+    timeout_seconds = 30
+
+    for hour_back in range(0, max_lookback_hours + 1):
+        attempt_time = target_time - timedelta(hours=hour_back)
+        start_str = attempt_time.strftime("%Y%m%d%H00")
+        end_str = (attempt_time + timedelta(hours=1)).strftime("%Y%m%d%H00")
+        params = {
+            "securityToken": API_KEY,
+            "documentType": "A65",
+            "processType": "A16",
+            "outBiddingZone_Domain": DOMAIN_SVERIGE,
+            "periodStart": start_str,
+            "periodEnd": end_str,
+        }
+
+        last_exc = None
+        for attempt in range(1, max_retries + 1):
+            try:
+                r = requests.get(ENTSOE_URL, params=params, timeout=timeout_seconds)
+                if r.status_code != 200:
+                    return False, None, None, f"HTTP Error {r.status_code}"
+                root = ET.fromstring(r.content)
+                ns = {"ns": root.tag.split("}")[0].strip("{")}
+                points = root.findall(".//ns:Point", ns)
+                if not points:
+                    # If no points, check if the response contains an
+                    # acknowledgement explaining no data; then try earlier hour.
+                    logger.info(
+                        f"ENTSOE: inga punkter för {attempt_time.isoformat()}, försöker tidigare timme"
+                    )
+                    break
+                values = [
+                    float(p.find("ns:quantity", ns).text)
+                    for p in points
+                    if p.find("ns:quantity", ns) is not None
+                ]
+                return (
+                    True,
+                    float(np.mean(values)),
+                    attempt_time.strftime("%Y-%m-%d %H:00 UTC"),
+                    None,
+                )
+            except Exception as e:
+                last_exc = e
+                logger.warning(
+                    f"ENTSOE fetch network attempt {attempt} failed: {e} (timeout={timeout_seconds}s)"
+                )
+                if attempt < max_retries:
+                    sleep_time = 5 * (2 ** (attempt - 1))
+                    time.sleep(sleep_time)
+                else:
+                    return False, None, None, str(last_exc)
+
+    return False, None, None, "Inga punkter hittade för senaste timmarna."
 
 
 def fetch_entsoe_load_forecast(forecast_date):
