@@ -54,10 +54,10 @@ for stad, station_ids in stader.items():
     station_id, csv_text_raw = get_working_station(station_ids)
 
     if station_id is None:
-        print(f"  ❌ Ingen fungerande station för {stad}")
+        print(f"  Ingen fungerande station för {stad}")
         continue
 
-    print(f"  ✔ använder station {station_id}")
+    print(f"  använder station {station_id}")
 
     rader = csv_text_raw.splitlines()
 
@@ -68,7 +68,7 @@ for stad, station_ids in stader.items():
             break
 
     if start is None:
-        print("  ❌ kunde inte läsa CSV")
+        print("  kunde inte läsa CSV")
         continue
 
     csv_text = "\n".join(rader[start:])

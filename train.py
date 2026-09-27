@@ -39,7 +39,7 @@ def train_grid_loss_model():
         )
         
         # 5. Träna modellen
-        print("\nTränar XGBoost-modellen på din M2 Mac...")
+        print("\nTränar XGBoost-modellen...")
         model.fit(
             X_train, y_train,
             eval_set=[(X_test, y_test)],
