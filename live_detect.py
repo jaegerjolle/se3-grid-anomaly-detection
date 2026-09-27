@@ -22,7 +22,7 @@ def load_api_key():
             return f.read().strip()
     except FileNotFoundError:
         import streamlit as st
-        st.error("❌ Hittade inte 'key.txt'. Se till att filen finns i mappen.")
+        st.error("Hittade inte 'key.txt'. Se till att filen finns i mappen.")
         st.stop()
     # Detta skriver ut nyckelns längd och de första/sista tecknen i din terminal
     print(f"DEBUG: Nyckelns längd är {len(API_KEY)} tecken.")
@@ -121,7 +121,7 @@ def fetch_entsoe_load_forecast(forecast_date):
     today_date = datetime.now(timezone.utc).date()
     
     if forecast_date > today_date and current_utc_hour < 11:
-        logger.warning(f"⚠️ Morgondagens prognos är inte släppt än. Hämtar dagens prognos.")
+        logger.warning(f"Morgondagens prognos är inte släppt än. Hämtar dagens prognos.")
         forecast_date = today_date
 
     try:
@@ -151,7 +151,7 @@ def fetch_entsoe_load_forecast(forecast_date):
         # Skala ner till SE3 (60 % av Sveriges totala elbehov)
         se3_values = [val * 0.60 for val in sverige_values]
         
-        logger.info(f"🎉 Succé! Skarp SE3-kurva laddad via PandasClient. Topp: {max(se3_values):.0f} MW")
+        logger.info(f"Succé! Skarp SE3-kurva laddad via PandasClient. Topp: {max(se3_values):.0f} MW")
         return True, se3_values, None
         
     except Exception as e:
@@ -247,7 +247,7 @@ def load_ai_model():
 try:
     model = load_ai_model()
 except Exception as e:
-    st.error("❌ Modellfilen saknas i `saved_models/`.")
+    st.error("Modellfilen saknas i `saved_models/`.")
     st.stop()
 
 # --- SAKTLÄGE / GLOBAL DATA FETCHING ---
@@ -285,7 +285,7 @@ else:
             0, 1.5
         )
     else:
-        grid_timestamp = "⚠️ FALLBACK"
+        grid_timestamp = "FALLBACK"
 
     for name, info in CITIES.items():
         w_success, w_val, w_time, w_err = fetch_live_temperature(
@@ -328,7 +328,7 @@ tab1, tab2 = st.tabs(["🕒 Real-time Detection", "🔮 Day-Ahead Forecasting (2
 # ==============================================================================
 with tab1:
     st.markdown(
-        f"### 📅 **Huvudsynk (Börvärde Nuet):** `{target_time.strftime('%Y-%m-%d Kl %H:00')} UTC`"
+        f"###  **Huvudsynk (Börvärde Nuet):** `{target_time.strftime('%Y-%m-%d Kl %H:00')} UTC`"
     )
 
     temp_array = list(temps.values())
@@ -402,7 +402,7 @@ with tab1:
 # ==============================================================================
 with tab2:
     st.markdown(
-        f"### 🔮 **Prognoshorisont (Morgondagen):** `{tomorrow_date.strftime('%Y-%m-%d')}` (24 timmar UTC)"
+        f"###  **Prognoshorisont (Morgondagen):** `{tomorrow_date.strftime('%Y-%m-%d')}` (24 timmar UTC)"
     )
 
     hours_axis = list(range(24))
@@ -420,7 +420,7 @@ with tab2:
             if f_success and len(f_vals) == 24:
                 forecast_loads = f_vals
                 st.success(
-                    "✔ Morgondagens 24h lastprognos synkroniserad till SE3-nivå."
+                    "Morgondagens 24h lastprognos synkroniserad till SE3-nivå."
                 )
             else:
                 st.warning(
@@ -472,16 +472,16 @@ with tab2:
         }
     ).set_index("Timme (UTC)")
 
-    st.markdown("### 📈 Beräknade nätförluster vs Planerad systemlast")
+    st.markdown("### Beräknade nätförluster vs Planerad systemlast")
 
     col_chart1, col_chart2 = st.columns(2)
     with col_chart1:
-        st.subheader("🤖 AI-Prognos: Förväntade Förluster (MWh)")
+        st.subheader("AI-Prognos: Förväntade Förluster (MWh)")
         st.line_chart(chart_data["AI-Förväntad Förlust (MWh)"], color="#29b5e8")
 
     with col_chart2:
-        st.subheader("🔌 Systemlast: Planerat Elbehov (MWh)")
+        st.subheader("Systemlast: Planerat Elbehov (MWh)")
         st.line_chart(chart_data["Planerad Last (MWh)"], color="#ff4b4b")
 
-    with st.expander("📊 Visa rådata för prognosdygnet (Timme för timme)"):
+    with st.expander("Visa rådata för prognosdygnet (Timme för timme)"):
         st.dataframe(chart_data.T)
