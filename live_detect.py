@@ -294,7 +294,7 @@ else:
         if w_success:
             temps[info["temp_col"]], temp_timestamps[name] = w_val, w_time
         else:
-            temps[info["temp_col"]], temp_timestamps[name] = 15.0, "⚠️ FALLBACK"
+            temps[info["temp_col"]], temp_timestamps[name] = 15.0, "FALLBACK"
             weather_all_ok = False
 
 # ==================== API STATUS & SYSTEMHÄLSA (SIDEBAR) ====================
@@ -318,7 +318,7 @@ else:
 
 
 # ==================== MAIN DASHBOARD TABS ====================
-st.title("⚡ Real-time Grid Analytics & Forecasting (SE3)")
+st.title("Real-time Grid Analytics & Forecasting (SE3)")
 st.write("---")
 
 tab1, tab2 = st.tabs(["🕒 Real-time Detection", "🔮 Day-Ahead Forecasting (24h)"])
