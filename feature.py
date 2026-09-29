@@ -101,7 +101,7 @@ def build_features():
     df_final = df_merged[final_cols]
     df_final.to_csv("final_training_features.csv", index=False)
     
-    print(f"\nSUCCESS! File 'final_training_features.csv' is ready for your M2 MacBook Mac.")
+    print(f"\nSUCCESS! File 'final_training_features.csv' is ready.")
     print(f"Matrix Dimensions: {df_final.shape}")
     print(df_final[["timestamp", "loadMw", "temp_mean", "gridLossesMwh"]].head(3))
 
