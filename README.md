@@ -16,15 +16,19 @@ Output: Predicted vs. actual grid losses -> Anomaly alert if residual > 15 MWh
 1. Setup:
 pip install -r requirements.txt
 
-2. Fetch Data:
+2. Get API key
+In order to get the API key you need to have an account on:
+https://transparency.entsoe.eu and send a mail to them requesting the API key.
+
+3. Fetch Data:
 python smhi_weather_harvest.py    # Weather from SMHI (2 years historical)
 python fetch_svk_data.py          # Grid data from SVK (2 years historical)
 python feature.py                 # Merge & engineer features
 
-3. Train Model:
+4. Train Model:
 python train.py
 
-4. Run Live Dashboard:
+5. Run Live Dashboard:
 streamlit run live_detect.py
 
 Visit http://localhost:8501
