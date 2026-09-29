@@ -16,7 +16,7 @@ Output: Predicted vs. actual grid losses -> Anomaly alert if residual > 15 MWh
 1. Setup:
 pip install -r requirements.txt
 
-2. Get API key
+2. Get API key: 
 In order to get the API key you need to have an account on:
 https://transparency.entsoe.eu and send a mail to them requesting the API key.
 
